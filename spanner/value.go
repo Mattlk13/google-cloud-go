@@ -71,19 +71,19 @@ var (
 // Encoder is the interface implemented by a custom type that can be encoded to
 // a supported type by Spanner. A code example:
 //
-// type customField struct {
-//     Prefix string
-//     Suffix string
-// }
+//   type customField struct {
+//       Prefix string
+//       Suffix string
+//   }
 //
-// // Convert a customField value to a string
-// func (cf customField) EncodeSpanner() (interface{}, error) {
-//     var b bytes.Buffer
-//     b.WriteString(cf.Prefix)
-//     b.WriteString("-")
-//     b.WriteString(cf.Suffix)
-//     return b.String(), nil
-// }
+//   // Convert a customField value to a string
+//   func (cf customField) EncodeSpanner() (interface{}, error) {
+//       var b bytes.Buffer
+//       b.WriteString(cf.Prefix)
+//       b.WriteString("-")
+//       b.WriteString(cf.Suffix)
+//       return b.String(), nil
+//   }
 type Encoder interface {
 	EncodeSpanner() (interface{}, error)
 }
@@ -91,24 +91,24 @@ type Encoder interface {
 // Decoder is the interface implemented by a custom type that can be decoded
 // from a supported type by Spanner. A code example:
 //
-// type customField struct {
-//     Prefix string
-//     Suffix string
-// }
+//   type customField struct {
+//       Prefix string
+//       Suffix string
+//   }
 //
-// // Convert a string to a customField value
-// func (cf *customField) DecodeSpanner(val interface{}) (err error) {
-//     strVal, ok := val.(string)
-//     if !ok {
-//         return fmt.Errorf("failed to decode customField: %v", val)
-//     }
-//     s := strings.Split(strVal, "-")
-//     if len(s) > 1 {
-//         cf.Prefix = s[0]
-//         cf.Suffix = s[1]
-//     }
-//     return nil
-// }
+//   // Convert a string to a customField value
+//   func (cf *customField) DecodeSpanner(val interface{}) (err error) {
+//       strVal, ok := val.(string)
+//       if !ok {
+//           return fmt.Errorf("failed to decode customField: %v", val)
+//       }
+//       s := strings.Split(strVal, "-")
+//       if len(s) > 1 {
+//           cf.Prefix = s[0]
+//           cf.Suffix = s[1]
+//       }
+//       return nil
+//   }
 type Decoder interface {
 	DecodeSpanner(input interface{}) error
 }
@@ -1355,8 +1355,8 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 			return errNilDst(p)
 		}
 		if !isPtrStructPtrSlice(vp.Type()) {
-			// The container is not a pointer to a struct pointer slice.
-			return errTypeMismatch(code, acode, ptr)
+			// The container is not a slice of struct pointers.
+			return fmt.Errorf("the container is not a slice of struct pointers: %v", errTypeMismatch(code, acode, ptr))
 		}
 		// Only use reflection for nil detection on slow path.
 		// Also, IsNil panics on many types, so check it after the type check.
@@ -2389,7 +2389,7 @@ func decodeStruct(ty *sppb.StructType, pb *proto3.ListValue, ptr interface{}) er
 
 	fields, err := fieldCache.Fields(t)
 	if err != nil {
-		return toSpannerError(err)
+		return ToSpannerError(err)
 	}
 	seen := map[string]bool{}
 	for i, f := range ty.Fields {
@@ -3067,6 +3067,7 @@ func isSupportedMutationType(v interface{}) bool {
 		float64, *float64, []float64, []*float64, NullFloat64, []NullFloat64,
 		time.Time, *time.Time, []time.Time, []*time.Time, NullTime, []NullTime,
 		civil.Date, *civil.Date, []civil.Date, []*civil.Date, NullDate, []NullDate,
+		big.Rat, *big.Rat, []big.Rat, []*big.Rat, NullNumeric, []NullNumeric,
 		GenericColumnValue:
 		return true
 	default:

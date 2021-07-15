@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func buildSQL(x interface{ addSQL(*strings.Builder) }) string {
@@ -154,14 +155,80 @@ func (co ColumnOptions) SQL() string {
 	return str
 }
 
+func (ad AlterDatabase) SQL() string {
+	return "ALTER DATABASE " + ad.Name.SQL() + " " + ad.Alteration.SQL()
+}
+
+func (sdo SetDatabaseOptions) SQL() string {
+	return "SET " + sdo.Options.SQL()
+}
+
+func (do DatabaseOptions) SQL() string {
+	str := "OPTIONS ("
+	hasOpt := false
+	if do.OptimizerVersion != nil {
+		hasOpt = true
+		if *do.OptimizerVersion == 0 {
+			str += "optimizer_version=null"
+
+		} else {
+			str += fmt.Sprintf("optimizer_version=%v", *do.OptimizerVersion)
+		}
+	}
+	if do.VersionRetentionPeriod != nil {
+		hasOpt = true
+		if hasOpt {
+			str += ", "
+		}
+		if *do.VersionRetentionPeriod == "" {
+			str += "version_retention_period=null"
+		} else {
+			str += fmt.Sprintf("version_retention_period='%s'", *do.VersionRetentionPeriod)
+		}
+	}
+	if do.EnableKeyVisualizer != nil {
+		hasOpt = true
+		if hasOpt {
+			str += ", "
+		}
+		if *do.EnableKeyVisualizer {
+			str += "enable_key_visualizer=true"
+		} else {
+			str += "enable_key_visualizer=null"
+		}
+	}
+	str += ")"
+	return str
+}
+
 func (d *Delete) SQL() string {
 	return "DELETE FROM " + d.Table.SQL() + " WHERE " + d.Where.SQL()
+}
+
+func (u *Update) SQL() string {
+	str := "UPDATE " + u.Table.SQL() + " SET "
+	for i, item := range u.Items {
+		if i > 0 {
+			str += ", "
+		}
+		str += item.Column.SQL() + " = "
+		if item.Value != nil {
+			str += item.Value.SQL()
+		} else {
+			str += "DEFAULT"
+		}
+	}
+	str += " WHERE " + u.Where.SQL()
+	return str
 }
 
 func (cd ColumnDef) SQL() string {
 	str := cd.Name.SQL() + " " + cd.Type.SQL()
 	if cd.NotNull {
 		str += " NOT NULL"
+	}
+	if cd.Generated != nil {
+		str += " AS (" + cd.Generated.SQL() + ") STORED"
 	}
 	if cd.Options != (ColumnOptions{}) {
 		str += " " + cd.Options.SQL()
@@ -174,7 +241,7 @@ func (tc TableConstraint) SQL() string {
 	if tc.Name != "" {
 		str += "CONSTRAINT " + tc.Name.SQL() + " "
 	}
-	str += tc.ForeignKey.SQL()
+	str += tc.Constraint.SQL()
 	return str
 }
 
@@ -183,6 +250,10 @@ func (fk ForeignKey) SQL() string {
 	str += ") REFERENCES " + fk.RefTable.SQL() + " ("
 	str += idList(fk.RefColumns, ", ") + ")"
 	return str
+}
+
+func (c Check) SQL() string {
+	return "CHECK (" + c.Expr.SQL() + ")"
 }
 
 func (t Type) SQL() string {
@@ -210,6 +281,8 @@ func (tb TypeBase) SQL() string {
 		return "INT64"
 	case Float64:
 		return "FLOAT64"
+	case Numeric:
+		return "NUMERIC"
 	case String:
 		return "STRING"
 	case Bytes:
@@ -304,7 +377,7 @@ func (sfj SelectFromJoin) SQL() string {
 	// TODO: hints go here
 	str += sfj.RHS.SQL()
 	if sfj.On != nil {
-		str += " " + sfj.On.SQL()
+		str += " ON " + sfj.On.SQL()
 	} else if len(sfj.Using) > 0 {
 		str += " USING (" + idList(sfj.Using, ", ") + ")"
 	}
@@ -317,6 +390,14 @@ var joinTypes = map[JoinType]string{
 	FullJoin:  "FULL",
 	LeftJoin:  "LEFT",
 	RightJoin: "RIGHT",
+}
+
+func (sfu SelectFromUnnest) SQL() string {
+	str := "UNNEST(" + sfu.Expr.SQL() + ")"
+	if sfu.Alias != "" {
+		str += " AS " + sfu.Alias.SQL()
+	}
+	return str
 }
 
 func (o Order) SQL() string { return buildSQL(o) }
@@ -348,6 +429,11 @@ func (ao ArithOp) addSQL(sb *strings.Builder) {
 	switch ao.Op {
 	case Neg:
 		sb.WriteString("-(")
+		ao.RHS.addSQL(sb)
+		sb.WriteString(")")
+		return
+	case Plus:
+		sb.WriteString("+(")
 		ao.RHS.addSQL(sb)
 		sb.WriteString(")")
 		return
@@ -488,6 +574,13 @@ func (p Paren) addSQL(sb *strings.Builder) {
 	sb.WriteString(")")
 }
 
+func (a Array) SQL() string { return buildSQL(a) }
+func (a Array) addSQL(sb *strings.Builder) {
+	sb.WriteString("[")
+	addExprList(sb, []Expr(a), ", ")
+	sb.WriteString("]")
+}
+
 func (id ID) SQL() string { return buildSQL(id) }
 func (id ID) addSQL(sb *strings.Builder) {
 	// https://cloud.google.com/spanner/docs/lexical#identifiers
@@ -539,3 +632,13 @@ func (sl StringLiteral) addSQL(sb *strings.Builder) { fmt.Fprintf(sb, "%q", sl) 
 
 func (bl BytesLiteral) SQL() string                { return buildSQL(bl) }
 func (bl BytesLiteral) addSQL(sb *strings.Builder) { fmt.Fprintf(sb, "B%q", bl) }
+
+func (dl DateLiteral) SQL() string { return buildSQL(dl) }
+func (dl DateLiteral) addSQL(sb *strings.Builder) {
+	fmt.Fprintf(sb, "DATE '%04d-%02d-%02d'", dl.Year, dl.Month, dl.Day)
+}
+
+func (tl TimestampLiteral) SQL() string { return buildSQL(tl) }
+func (tl TimestampLiteral) addSQL(sb *strings.Builder) {
+	fmt.Fprintf(sb, "TIMESTAMP '%s'", time.Time(tl).Format("2006-01-02 15:04:05.000000 -07:00"))
+}

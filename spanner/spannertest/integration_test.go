@@ -27,6 +27,7 @@ package spannertest
 import (
 	"context"
 	"flag"
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -35,6 +36,7 @@ import (
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/spanner"
 	dbadmin "cloud.google.com/go/spanner/admin/database/apiv1"
+	v1 "cloud.google.com/go/spanner/apiv1"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -55,7 +57,7 @@ func dbName() string {
 	return "projects/fake-proj/instances/fake-instance/databases/fake-db"
 }
 
-func makeClient(t *testing.T) (*spanner.Client, *dbadmin.DatabaseAdminClient, func()) {
+func makeClient(t *testing.T) (*spanner.Client, *dbadmin.DatabaseAdminClient, *v1.Client, func()) {
 	// Despite the docs, this context is also used for auth,
 	// so it needs to be long-lived.
 	ctx := context.Background()
@@ -72,7 +74,13 @@ func makeClient(t *testing.T) (*spanner.Client, *dbadmin.DatabaseAdminClient, fu
 			client.Close()
 			t.Fatalf("Connecting DB admin client: %v", err)
 		}
-		return client, adminClient, func() { client.Close(); adminClient.Close() }
+		gapicClient, err := v1.NewClient(ctx, dialOpt)
+		if err != nil {
+			client.Close()
+			adminClient.Close()
+			t.Fatalf("Connecting Spanner generated client: %v", err)
+		}
+		return client, adminClient, gapicClient, func() { client.Close(); adminClient.Close(); gapicClient.Close() }
 	}
 
 	// Don't use SPANNER_EMULATOR_HOST because we need the raw connection for
@@ -101,16 +109,23 @@ func makeClient(t *testing.T) (*spanner.Client, *dbadmin.DatabaseAdminClient, fu
 		srv.Close()
 		t.Fatalf("Connecting to in-memory fake DB admin: %v", err)
 	}
-	return client, adminClient, func() {
+	gapicClient, err := v1.NewClient(ctx, option.WithGRPCConn(conn))
+	if err != nil {
+		srv.Close()
+		t.Fatalf("Connecting to in-memory fake generated Spanner client: %v", err)
+	}
+
+	return client, adminClient, gapicClient, func() {
 		client.Close()
 		adminClient.Close()
+		gapicClient.Close()
 		conn.Close()
 		srv.Close()
 	}
 }
 
 func TestIntegration_SpannerBasics(t *testing.T) {
-	client, adminClient, cleanup := makeClient(t)
+	client, adminClient, generatedClient, cleanup := makeClient(t)
 	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -136,6 +151,34 @@ func TestIntegration_SpannerBasics(t *testing.T) {
 	}
 	it.Stop()
 
+	// Try to execute the equivalent of a session pool ping.
+	// This used to cause a panic as ExecuteSql did not expect any requests
+	// that would execute a query without a transaction selector.
+	// https://github.com/googleapis/google-cloud-go/issues/3639
+	s, err := generatedClient.CreateSession(ctx, &spannerpb.CreateSessionRequest{Database: dbName()})
+	if err != nil {
+		t.Fatalf("Creating session: %v", err)
+	}
+	rs, err := generatedClient.ExecuteSql(ctx, &spannerpb.ExecuteSqlRequest{
+		Session: s.Name,
+		Sql:     "SELECT 1",
+	})
+	if err != nil {
+		t.Fatalf("Executing ping: %v", err)
+	}
+	if len(rs.Rows) != 1 {
+		t.Fatalf("Ping gave %v rows, want 1", len(rs.Rows))
+	}
+	if len(rs.Rows[0].Values) != 1 {
+		t.Fatalf("Ping gave %v cols, want 1", len(rs.Rows[0].Values))
+	}
+	if rs.Rows[0].Values[0].GetStringValue() != "1" {
+		t.Fatalf("Ping gave value %v, want '1'", rs.Rows[0].Values[0].GetStringValue())
+	}
+	if err = generatedClient.DeleteSession(ctx, &spannerpb.DeleteSessionRequest{Name: s.Name}); err != nil {
+		t.Fatalf("Deleting session: %v", err)
+	}
+
 	// Drop any previous test table/index, and make a fresh one in a few stages.
 	const tableName = "Characters"
 	err = updateDDL(t, adminClient, "DROP INDEX AgeIndex")
@@ -146,7 +189,9 @@ func TestIntegration_SpannerBasics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dropping old index: %v", err)
 	}
-	dropTable(t, adminClient, tableName)
+	if err := dropTable(t, adminClient, tableName); err != nil {
+		t.Fatal(err)
+	}
 	err = updateDDL(t, adminClient,
 		`CREATE TABLE `+tableName+` (
 			FirstName STRING(20) NOT NULL,
@@ -397,22 +442,35 @@ func TestIntegration_SpannerBasics(t *testing.T) {
 }
 
 func TestIntegration_ReadsAndQueries(t *testing.T) {
-	client, adminClient, cleanup := makeClient(t)
+	client, adminClient, _, cleanup := makeClient(t)
 	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Drop any old tables.
+	// Do them all concurrently; this saves a lot of time.
 	allTables := []string{
 		"Staff",
 		"PlayerStats",
-		"JoinA",
-		"JoinB",
-		"SomeStrings",
+		"JoinA", "JoinB", "JoinC", "JoinD", "JoinE", "JoinF",
+		"SomeStrings", "Updateable",
 	}
+	errc := make(chan error)
 	for _, table := range allTables {
-		dropTable(t, adminClient, table)
+		go func(table string) {
+			errc <- dropTable(t, adminClient, table)
+		}(table)
+	}
+	var bad bool
+	for range allTables {
+		if err := <-errc; err != nil {
+			t.Error(err)
+			bad = true
+		}
+	}
+	if bad {
+		t.FailNow()
 	}
 
 	err := updateDDL(t, adminClient,
@@ -592,11 +650,21 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 			OpponentID INT64,
 			PointsScored INT64,
 		) PRIMARY KEY (LastName, OpponentID)`, // TODO: is this right?
-		// JoinA and JoinB are "A" and "B" from https://cloud.google.com/spanner/docs/query-syntax#join_types.
+		// JoinFoo are from https://cloud.google.com/spanner/docs/query-syntax#join_types.
+		// They aren't consistently named in the docs.
 		`CREATE TABLE JoinA ( w INT64, x STRING(MAX) ) PRIMARY KEY (w, x)`,
 		`CREATE TABLE JoinB ( y INT64, z STRING(MAX) ) PRIMARY KEY (y, z)`,
+		`CREATE TABLE JoinC ( x INT64, y STRING(MAX) ) PRIMARY KEY (x, y)`,
+		`CREATE TABLE JoinD ( x INT64, z STRING(MAX) ) PRIMARY KEY (x, z)`,
+		`CREATE TABLE JoinE ( w INT64, x STRING(MAX) ) PRIMARY KEY (w, x)`,
+		`CREATE TABLE JoinF ( y INT64, z STRING(MAX) ) PRIMARY KEY (y, z)`,
 		// Some other test tables.
 		`CREATE TABLE SomeStrings ( i INT64, str STRING(MAX) ) PRIMARY KEY (i)`,
+		`CREATE TABLE Updateable (
+			id INT64,
+			first STRING(MAX),
+			last STRING(MAX),
+		) PRIMARY KEY (id)`,
 	)
 	if err != nil {
 		t.Fatalf("Creating sample tables: %v", err)
@@ -618,13 +686,59 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 		spanner.Insert("JoinB", []string{"y", "z"}, []interface{}{3, "n"}),
 		spanner.Insert("JoinB", []string{"y", "z"}, []interface{}{4, "p"}),
 
+		// JoinC and JoinD have the same contents as JoinA and JoinB; they have different column names.
+		spanner.Insert("JoinC", []string{"x", "y"}, []interface{}{1, "a"}),
+		spanner.Insert("JoinC", []string{"x", "y"}, []interface{}{2, "b"}),
+		spanner.Insert("JoinC", []string{"x", "y"}, []interface{}{3, "c"}),
+		spanner.Insert("JoinC", []string{"x", "y"}, []interface{}{3, "d"}),
+
+		spanner.Insert("JoinD", []string{"x", "z"}, []interface{}{2, "k"}),
+		spanner.Insert("JoinD", []string{"x", "z"}, []interface{}{3, "m"}),
+		spanner.Insert("JoinD", []string{"x", "z"}, []interface{}{3, "n"}),
+		spanner.Insert("JoinD", []string{"x", "z"}, []interface{}{4, "p"}),
+
+		// JoinE and JoinF are used in the CROSS JOIN test.
+		spanner.Insert("JoinE", []string{"w", "x"}, []interface{}{1, "a"}),
+		spanner.Insert("JoinE", []string{"w", "x"}, []interface{}{2, "b"}),
+
+		spanner.Insert("JoinF", []string{"y", "z"}, []interface{}{2, "c"}),
+		spanner.Insert("JoinF", []string{"y", "z"}, []interface{}{3, "d"}),
+
 		spanner.Insert("SomeStrings", []string{"i", "str"}, []interface{}{0, "afoo"}),
 		spanner.Insert("SomeStrings", []string{"i", "str"}, []interface{}{1, "abar"}),
 		spanner.Insert("SomeStrings", []string{"i", "str"}, []interface{}{2, nil}),
 		spanner.Insert("SomeStrings", []string{"i", "str"}, []interface{}{3, "bbar"}),
+
+		spanner.Insert("Updateable", []string{"id", "first", "last"}, []interface{}{0, "joe", nil}),
+		spanner.Insert("Updateable", []string{"id", "first", "last"}, []interface{}{1, "doe", "joan"}),
+		spanner.Insert("Updateable", []string{"id", "first", "last"}, []interface{}{2, "wong", "wong"}),
 	})
 	if err != nil {
 		t.Fatalf("Inserting sample data: %v", err)
+	}
+
+	// Perform UPDATE DML; the results are checked later on.
+	n = 0
+	_, err = client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		for _, u := range []string{
+			`UPDATE Updateable SET last = "bloggs" WHERE id = 0`,
+			`UPDATE Updateable SET first = last, last = first WHERE id = 1`,
+			`UPDATE Updateable SET last = DEFAULT WHERE id = 2`,
+			`UPDATE Updateable SET first = "noname" WHERE id = 3`, // no id=3
+		} {
+			nr, err := tx.Update(ctx, spanner.NewStatement(u))
+			if err != nil {
+				return err
+			}
+			n += nr
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Updating with DML: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("Updating with DML affected %d rows, want 3", n)
 	}
 
 	// Do some complex queries.
@@ -818,6 +932,14 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 			},
 		},
 		{
+			// From https://cloud.google.com/spanner/docs/aggregate_functions#avg.
+			`SELECT AVG(x) AS avg FROM UNNEST([0, 2, 4, 4, 5]) AS x`,
+			nil,
+			[][]interface{}{
+				{float64(3)},
+			},
+		},
+		{
 			`SELECT MAX(Name) FROM Staff WHERE Name < @lim`,
 			map[string]interface{}{"lim": "Teal'c"},
 			[][]interface{}{
@@ -839,8 +961,7 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 			},
 		},
 		{
-			// TODO: This is broken against production; does not permit ORDER BY on something not grouped/aggregated.
-			`SELECT ARRAY_AGG(Cool) FROM Staff ORDER BY Name`,
+			`SELECT ARRAY_AGG(Cool) FROM Staff`,
 			nil,
 			[][]interface{}{
 				// Daniel, George (NULL), Jack (NULL), Sam, Teal'c
@@ -849,16 +970,48 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 		},
 		// SELECT with aliases.
 		{
+			// Aliased table.
 			`SELECT s.Name FROM Staff AS s WHERE s.ID = 3 ORDER BY s.Tenure`,
 			nil,
 			[][]interface{}{
 				{"Sam"},
 			},
 		},
+		{
+			// Aliased expression.
+			`SELECT Name AS nom FROM Staff WHERE ID < 4 ORDER BY nom`,
+			nil,
+			[][]interface{}{
+				{"Daniel"},
+				{"Jack"},
+				{"Sam"},
+			},
+		},
 		// Joins.
 		{
-			// TODO: This is broken against production; row ordering is wrong.
-			`SELECT * FROM JoinA LEFT OUTER JOIN JoinB AS B ON JoinA.w = B.y`,
+			`SELECT * FROM JoinA INNER JOIN JoinB ON JoinA.w = JoinB.y ORDER BY w, x, y, z`,
+			nil,
+			[][]interface{}{
+				{int64(2), "b", int64(2), "k"},
+				{int64(3), "c", int64(3), "m"},
+				{int64(3), "c", int64(3), "n"},
+				{int64(3), "d", int64(3), "m"},
+				{int64(3), "d", int64(3), "n"},
+			},
+		},
+		{
+			`SELECT * FROM JoinE CROSS JOIN JoinF ORDER BY w, x, y, z`,
+			nil,
+			[][]interface{}{
+				{int64(1), "a", int64(2), "c"},
+				{int64(1), "a", int64(3), "d"},
+				{int64(2), "b", int64(2), "c"},
+				{int64(2), "b", int64(3), "d"},
+			},
+		},
+		{
+			// Same as in docs, but with a weird ORDER BY clause to match the row ordering.
+			`SELECT * FROM JoinA FULL OUTER JOIN JoinB ON JoinA.w = JoinB.y ORDER BY w IS NULL, w, x, y, z`,
 			nil,
 			[][]interface{}{
 				{int64(1), "a", nil, nil},
@@ -867,6 +1020,81 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 				{int64(3), "c", int64(3), "n"},
 				{int64(3), "d", int64(3), "m"},
 				{int64(3), "d", int64(3), "n"},
+				{nil, nil, int64(4), "p"},
+			},
+		},
+		{
+			// Same as the previous, but using a USING clause instead of an ON clause.
+			`SELECT * FROM JoinC FULL OUTER JOIN JoinD USING (x) ORDER BY x, y, z`,
+			nil,
+			[][]interface{}{
+				{int64(1), "a", nil},
+				{int64(2), "b", "k"},
+				{int64(3), "c", "m"},
+				{int64(3), "c", "n"},
+				{int64(3), "d", "m"},
+				{int64(3), "d", "n"},
+				{int64(4), nil, "p"},
+			},
+		},
+		{
+			`SELECT * FROM JoinA LEFT OUTER JOIN JoinB AS B ON JoinA.w = B.y ORDER BY w, x, y, z`,
+			nil,
+			[][]interface{}{
+				{int64(1), "a", nil, nil},
+				{int64(2), "b", int64(2), "k"},
+				{int64(3), "c", int64(3), "m"},
+				{int64(3), "c", int64(3), "n"},
+				{int64(3), "d", int64(3), "m"},
+				{int64(3), "d", int64(3), "n"},
+			},
+		},
+		{
+			// Same as the previous, but using a USING clause instead of an ON clause.
+			`SELECT * FROM JoinC LEFT OUTER JOIN JoinD USING (x) ORDER BY x, y, z`,
+			nil,
+			[][]interface{}{
+				{int64(1), "a", nil},
+				{int64(2), "b", "k"},
+				{int64(3), "c", "m"},
+				{int64(3), "c", "n"},
+				{int64(3), "d", "m"},
+				{int64(3), "d", "n"},
+			},
+		},
+		{
+			// Same as in docs, but with a weird ORDER BY clause to match the row ordering.
+			`SELECT * FROM JoinA RIGHT OUTER JOIN JoinB AS B ON JoinA.w = B.y ORDER BY w IS NULL, w, x, y, z`,
+			nil,
+			[][]interface{}{
+				{int64(2), "b", int64(2), "k"},
+				{int64(3), "c", int64(3), "m"},
+				{int64(3), "c", int64(3), "n"},
+				{int64(3), "d", int64(3), "m"},
+				{int64(3), "d", int64(3), "n"},
+				{nil, nil, int64(4), "p"},
+			},
+		},
+		{
+			`SELECT * FROM JoinC RIGHT OUTER JOIN JoinD USING (x) ORDER BY x, y, z`,
+			nil,
+			[][]interface{}{
+				{int64(2), "b", "k"},
+				{int64(3), "c", "m"},
+				{int64(3), "c", "n"},
+				{int64(3), "d", "m"},
+				{int64(3), "d", "n"},
+				{int64(4), nil, "p"},
+			},
+		},
+		// Check the output of the UPDATE DML.
+		{
+			`SELECT id, first, last FROM Updateable ORDER BY id`,
+			nil,
+			[][]interface{}{
+				{int64(0), "joe", "bloggs"},
+				{int64(1), "joan", "doe"},
+				{int64(2), "wong", nil},
 			},
 		},
 		// Regression test for aggregating no rows; it used to return an empty row.
@@ -890,7 +1118,7 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 				{int64(1)},
 			},
 		},
-		// Regression TEST for mishandling NULLs with LIKE operator.
+		// Regression test for mishandling NULLs with LIKE operator.
 		{
 			`SELECT i, str FROM SomeStrings WHERE str LIKE "%bar"`,
 			nil,
@@ -908,9 +1136,75 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 				{int64(0), "afoo"},
 			},
 		},
+		// Regression test for ORDER BY combined with SELECT aliases.
+		{
+			`SELECT Name AS nom FROM Staff ORDER BY ID LIMIT 2`,
+			nil,
+			[][]interface{}{
+				{"Jack"},
+				{"Daniel"},
+			},
+		},
+		{
+			`SELECT MIN(Name), MAX(Name) FROM Staff`,
+			nil,
+			[][]interface{}{
+				{"Daniel", "Teal'c"},
+			},
+		},
+		{
+			`SELECT Cool, MIN(Name), MAX(Name), COUNT(*) FROM Staff GROUP BY Cool ORDER BY Cool`,
+			nil,
+			[][]interface{}{
+				{nil, "George", "Jack", int64(2)},
+				{false, "Daniel", "Sam", int64(2)},
+				{true, "Teal'c", "Teal'c", int64(1)},
+			},
+		},
+		{
+			`SELECT Tenure/2, Cool, Name FROM Staff WHERE Tenure/2 > 5`,
+			nil,
+			[][]interface{}{
+				{float64(5.5), false, "Daniel"},
+			},
+		},
+		{
+			`SELECT Tenure/2, MAX(Cool) FROM Staff WHERE Tenure/2 > 5 GROUP BY Tenure/2`,
+			nil,
+			[][]interface{}{
+				{float64(5.5), false},
+			},
+		},
+		{
+			`SELECT Tenure/2, Cool, MIN(Name) FROM Staff WHERE Tenure/2 >= 4 GROUP BY Tenure/2, Cool ORDER BY Cool DESC, Tenure/2`,
+			nil,
+			[][]interface{}{
+				{float64(4), true, "Teal'c"},
+				{float64(4.5), false, "Sam"},
+				{float64(5.5), false, "Daniel"},
+				{float64(5), nil, "Jack"},
+			},
+		},
+		{
+			`SELECT MIN(Cool), MAX(Cool), MIN(Tenure), MAX(Tenure), MIN(Height), MAX(Height), MIN(Name), MAX(Name), COUNT(*) FROM Staff`,
+			nil,
+			[][]interface{}{
+				{false, true, int64(6), int64(11), 1.73, 1.91, "Daniel", "Teal'c", int64(5)},
+			},
+		},
+		{
+			`SELECT Cool, MIN(Tenure), MAX(Tenure), MIN(Height), MAX(Height), MIN(Name), MAX(Name), COUNT(*) FROM Staff GROUP BY Cool ORDER BY Cool`,
+			nil,
+			[][]interface{}{
+				{nil, int64(6), int64(10), 1.73, 1.85, "George", "Jack", int64(2)},
+				{false, int64(9), int64(11), 1.75, 1.83, "Daniel", "Sam", int64(2)},
+				{true, int64(8), int64(8), 1.91, 1.91, "Teal'c", "Teal'c", int64(1)},
+			},
+		},
 	}
 	var failures int
 	for _, test := range tests {
+		t.Logf("Testing query: %s", test.q)
 		stmt := spanner.NewStatement(test.q)
 		stmt.Params = test.params
 
@@ -931,7 +1225,7 @@ func TestIntegration_ReadsAndQueries(t *testing.T) {
 	}
 }
 
-func dropTable(t *testing.T, adminClient *dbadmin.DatabaseAdminClient, table string) {
+func dropTable(t *testing.T, adminClient *dbadmin.DatabaseAdminClient, table string) error {
 	t.Helper()
 	err := updateDDL(t, adminClient, "DROP TABLE "+table)
 	// NotFound is an acceptable failure mode here.
@@ -939,8 +1233,9 @@ func dropTable(t *testing.T, adminClient *dbadmin.DatabaseAdminClient, table str
 		err = nil
 	}
 	if err != nil {
-		t.Fatalf("Dropping old table %q: %v", table, err)
+		return fmt.Errorf("dropping old table %q: %v", table, err)
 	}
+	return nil
 }
 
 func updateDDL(t *testing.T, adminClient *dbadmin.DatabaseAdminClient, statements ...string) error {
